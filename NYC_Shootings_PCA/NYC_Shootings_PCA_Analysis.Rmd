@@ -1,0 +1,233 @@
+---
+title: "NYC Shootings: PCA and Spatial Analysis"
+author: "Darragh McGee"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Load Packages
+
+```{r load-packages}
+library(tidyverse)
+library(readr)
+library(psych)
+library(sf)
+library(MASS)
+library(spdep)
+library(corrplot)
+library(patchwork)
+library(ggplot2)
+library(splancs)
+library(adegenet)
+library(sandwich)
+library(lmtest)
+```
+
+## Load and Clean ACS Data
+
+```{r load-clean-acs}
+data_folder <- "C:/Users/darra/OneDrive/Desktop/Postgraduate Course/Dimensionality Reduction/Final Paper/ACS Data"
+zip_files <- list.files(path = data_folder, pattern = "\\.zip$", full.names = TRUE)
+data_list <- list()
+
+for (zip_path in zip_files) {
+  contents <- unzip(zip_path, list = TRUE)
+  data_file <- contents$Name[grepl("-Data\\.csv$", contents$Name)]
+
+  if (length(data_file) == 1) {
+    df <- read_csv(unz(zip_path, data_file))
+    df$table_code <- gsub(".zip", "", basename(zip_path))
+    data_list[[length(data_list) + 1]] <- df
+  }
+}
+
+combined_df <- reduce(data_list, full_join, by = "GEO_ID")
+cleaned_df <- combined_df[-c(1, 2), ]
+rownames(cleaned_df) <- NULL
+```
+
+## Feature Engineering
+
+```{r feature-engineering}
+cleaned_df <- cleaned_df %>%
+  mutate(
+    pct_poverty = as.numeric(B17001_002E) / as.numeric(B17001_001E),
+    pct_snap = as.numeric(B22010_002E) / as.numeric(B22010_001E),
+    pct_unemployed = as.numeric(B23025_005E) / (as.numeric(B23025_003E) + as.numeric(B23025_005E)),
+    pct_female_headed = as.numeric(B11003_016E) / as.numeric(B11003_001E),
+    pct_no_hs = rowSums(dplyr::select(., B15003_002E:B15003_016E) %>% mutate_all(as.numeric), na.rm = TRUE) / as.numeric(B15003_001E),
+    pct_under18 = rowSums(dplyr::select(., B01001_003E:B01001_006E, B01001_027E:B01001_030E) %>% mutate_all(as.numeric), na.rm = TRUE) / as.numeric(B01001_001E),
+    pct_renters = as.numeric(B25003_003E) / as.numeric(B25003_001E),
+    pct_moved_last_year = 1 - (as.numeric(B07001_017E) / as.numeric(B07001_001E)),
+    pct_vacant = as.numeric(B25002_003E) / as.numeric(B25002_001E),
+    pct_foreign_born = as.numeric(B05002_013E) / as.numeric(B05002_001E),
+    pct_overcrowded = (
+      as.numeric(B25014_005E) + as.numeric(B25014_006E) +
+        as.numeric(B25014_011E) + as.numeric(B25014_012E)
+    ) / as.numeric(B25014_001E),
+    pct_black = as.numeric(B02001_003E) / as.numeric(B02001_001E),
+    pct_male_15_29 = (
+      as.numeric(B01001_007E) + as.numeric(B01001_008E) + as.numeric(B01001_009E) +
+        as.numeric(B01001_031E) + as.numeric(B01001_032E) + as.numeric(B01001_033E)
+    ) / as.numeric(B01001_001E),
+    pop_size = B01003_001E
+  ) %>%
+  dplyr::select(
+    GEO_ID, pct_poverty, pct_snap, pct_unemployed, pct_female_headed,
+    pct_no_hs, pct_under18, pct_renters, pct_moved_last_year, pct_vacant,
+    pct_foreign_born, pct_overcrowded, pct_black, pct_male_15_29, pop_size
+  ) %>%
+  filter(as.numeric(pop_size) >= 100) %>%
+  filter(if_all(where(is.numeric), ~ !is.na(.) & is.finite(.)))
+```
+
+## Principal Component Analysis (PCA)
+
+```{r pca}
+disadv_vars <- cleaned_df %>% dplyr::select(pct_poverty, pct_snap, pct_unemployed, pct_female_headed, pct_no_hs, pct_under18)
+pca_disadv <- pca(disadv_vars, nfactors = 6, rotate = "none", covar = FALSE)
+cleaned_df$disadvantage_pca <- pca_disadv$scores[, 1]
+
+instability_vars <- cleaned_df %>% dplyr::select(pct_moved_last_year, pct_vacant, pct_foreign_born, pct_overcrowded)
+pca_instability <- pca(instability_vars, nfactors = 4, rotate = "none", covar = FALSE)
+cleaned_df$instability_pca <- pca_instability$scores[, 1]
+```
+
+## Load Shootings and Spatial Data
+
+```{r load-spatial-data}
+tracts <- st_read("C:/Users/darra/OneDrive/Desktop/Postgraduate Course/Dimensionality Reduction/Final Paper/tl_2020_36_tract/tl_2020_36_tract.shp")
+shootings <- read_csv("C:/Users/darra/OneDrive/Desktop/Postgraduate Course/Dimensionality Reduction/Final Paper/NYPD_Shooting_Incidents.csv") %>%
+  filter(!is.na(Longitude), !is.na(Latitude))
+shootings_sf <- st_as_sf(shootings, coords = c("Longitude", "Latitude"), crs = 4326) %>%
+  st_transform(st_crs(tracts))
+shootings_tracts <- st_join(shootings_sf, tracts[, c("GEOID")], join = st_within)
+shooting_counts <- shootings_tracts %>% st_drop_geometry() %>% count(GEOID, name = "shootings") %>%
+  mutate(GEO_ID = paste0("1400000US", GEOID))
+```
+
+## Merge and Run Models
+
+```{r merge-model}
+final_df <- left_join(cleaned_df, shooting_counts %>% dplyr::select(GEO_ID, shootings), by = "GEO_ID") %>%
+  mutate(shootings = replace_na(shootings, 0),
+         disadvantage_pca = scale(disadvantage_pca)[, 1],
+         instability_pca = scale(instability_pca)[, 1])
+
+poisson_model <- glm(shootings ~ disadvantage_pca + instability_pca + pct_black + pct_male_15_29 + 
+                       offset(log(as.numeric(pop_size))),
+                     data = final_df,
+                     family = poisson)
+summary(poisson_model)
+
+nb_model <- glm.nb(shootings ~ disadvantage_pca + instability_pca + pct_black + pct_male_15_29 +
+                     offset(log(as.numeric(pop_size))),
+                   data = final_df)
+summary(nb_model)
+```
+
+## Spatial Autocorrelation
+
+```{r spatial-autocorrelation}
+final_df <- final_df %>% mutate(GEOID = str_remove(GEO_ID, "^1400000US"))
+final_sf <- tracts %>% left_join(final_df, by = "GEOID") %>% filter(!is.na(shootings))
+nb <- poly2nb(final_sf, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+resid_nb <- residuals(nb_model, type = "pearson")
+moran_test <- moran.test(resid_nb, lw, zero.policy = TRUE)
+moran_test
+```
+
+## Mapping Residuals and Principal Components
+
+```{r plot-maps}
+final_sf$residuals <- resid_nb
+
+residuals_map <- ggplot(final_sf) +
+  geom_sf(aes(fill = residuals), color = "grey20", size = 0.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-3, 3)) +
+  labs(title = "Spatial Distribution of Pearson Residuals") +
+  theme_minimal()
+
+pc_disadv <- ggplot(final_sf) +
+  geom_sf(aes(fill = disadvantage_pca), color = "grey20", size = 0.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-3, 3)) +
+  labs(title = "Concentrated Disadvantage (PC1)") +
+  theme_minimal()
+
+pc_instab <- ggplot(final_sf) +
+  geom_sf(aes(fill = instability_pca), color = "grey20", size = 0.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-3, 3)) +
+  labs(title = "Residential Instability (PC1)") +
+  theme_minimal()
+
+residuals_map
+pc_disadv
+pc_instab
+```
+
+## Spatial PCA (sPCA)
+
+```{r spca}
+tract_coords <- st_coordinates(st_centroid(final_sf))
+disadv_data_xy <- as.data.frame(scale(disadv_vars))
+disadv_data_xy$X <- tract_coords[, 1]
+disadv_data_xy$Y <- tract_coords[, 2]
+
+spca_result <- spca(disadv_data_xy[, 1:6], xy = disadv_data_xy[, c("X", "Y")], type = 2, scannf = FALSE, nfposi = 2)
+final_sf$spca_disadv <- scale(spca_result$li[, 1])[, 1]
+
+instab_data_xy <- as.data.frame(scale(instability_vars))
+instab_data_xy$X <- tract_coords[, 1]
+instab_data_xy$Y <- tract_coords[, 2]
+
+spca_result_instab <- spca(instab_data_xy[, 1:4], xy = instab_data_xy[, c("X", "Y")], type = 2, scannf = FALSE, nfposi = 2)
+final_sf$spca_instab <- scale(spca_result_instab$li[, 1])[, 1]
+```
+
+## Final Model with Spatial Components
+
+```{r model-spca}
+nb_model_spca <- glm.nb(shootings ~ spca_disadv + spca_instab + pct_black + pct_male_15_29 +
+                          offset(log(as.numeric(pop_size))),
+                        data = final_sf)
+summary(nb_model_spca)
+
+robust_se_spca <- vcovHC(nb_model_spca, type = "HC1")
+coeftest(nb_model_spca, vcov = robust_se_spca)
+
+# Moran test for residuals from the spatial PCA model
+resid_nb_spca <- residuals(nb_model_spca, type = "pearson")
+final_sf$residuals_spca <- resid_nb_spca
+moran_spca_test <- moran.test(resid_nb_spca, lw, zero.policy = TRUE)
+moran_spca_test
+```
+
+## Mapping Residuals and Principal Components (Spatial PCA Model)
+
+```{r plot-spca-maps}
+spca_residuals_map <- ggplot(final_sf) +
+  geom_sf(aes(fill = residuals_spca), color = "grey20", size = 0.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-3, 3)) +
+  labs(title = "Spatial PCA Model Residuals") +
+  theme_minimal()
+
+spc_disadv <- ggplot(final_sf) +
+  geom_sf(aes(fill = spca_disadv), color = "grey20", size = 0.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-3, 3)) +
+  labs(title = "Spatial PCA: Disadvantage (sPC1)") +
+  theme_minimal()
+
+spc_instab <- ggplot(final_sf) +
+  geom_sf(aes(fill = spca_instab), color = "grey20", size = 0.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limits = c(-3, 3)) +
+  labs(title = "Spatial PCA: Instability (sPC1)") +
+  theme_minimal()
+
+spca_residuals_map
+spc_disadv
+spc_instab
+```
